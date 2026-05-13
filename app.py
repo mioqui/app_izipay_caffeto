@@ -1,39 +1,81 @@
-from pathlib import Path
 from io import BytesIO
 
 import pandas as pd
 import streamlit as st
 
-from parser_izipay import read_folder
+from parser_izipay import parse_izipay_uploaded_file
 
 st.set_page_config(page_title="Izipay Caffeto - Lector de Vouchers", layout="wide")
 
 st.title("Lector de Vouchers IZIPAY - Caffeto")
-st.caption("Lee PDFs desde una carpeta, extrae Fecha, Hora, Monto, Propina, Total, ID y Tipo, y exporta a Excel.")
+st.caption("Sube vouchers PDF, extrae Fecha, Hora, Monto, Propina, Total, ID y Tipo, y exporta a Excel.")
+
+SHOW_COLS = ["Fecha", "Hora", "Monto", "Propina", "Total", "ID", "Tipo", "Medio", "Billetera", "REF", "AP", "Lote", "Term", "Archivo"]
+
+if "rows" not in st.session_state:
+    st.session_state.rows = []
+if "processed_keys" not in st.session_state:
+    st.session_state.processed_keys = set()
 
 with st.sidebar:
-    st.header("Configuración")
-    folder_default = str(Path.cwd() / "pdfs")
-    folder_path = st.text_input("Carpeta de PDFs", value=folder_default)
-    st.caption("Ejemplo Windows: C:\\Users\\Usuario\\Desktop\\izipay_pdfs")
-    st.caption("Ejemplo Mac: /Users/usuario/Desktop/izipay_pdfs")
-    refresh = st.button("Actualizar lectura", type="primary")
+    st.header("Carga de PDFs")
+    st.write("Sube uno o varios vouchers PDF. Puedes volver a cargar más archivos y se agregarán a la lista de la sesión.")
+    uploaded_files = st.file_uploader(
+        "Subir vouchers PDF",
+        type=["pdf"],
+        accept_multiple_files=True,
+        help="Selecciona uno o varios PDFs de IZIPAY."
+    )
 
-@st.cache_data(show_spinner=False)
-def load_data(path: str, cache_buster: int):
-    return read_folder(path)
+    process = st.button("Procesar PDFs cargados", type="primary")
+    clear = st.button("Limpiar sesión")
 
-# Cache buster simple: cambia cada vez que se presiona Actualizar.
-if "refresh_counter" not in st.session_state:
-    st.session_state.refresh_counter = 0
-if refresh:
-    st.session_state.refresh_counter += 1
+    st.divider()
+    st.caption("Nota: en Streamlit Cloud los datos permanecen durante la sesión. Para guardar el histórico permanente, descarga el Excel.")
 
-df = load_data(folder_path, st.session_state.refresh_counter)
+if clear:
+    st.session_state.rows = []
+    st.session_state.processed_keys = set()
+    st.success("Sesión limpiada.")
 
-if df.empty:
-    st.warning("No se encontraron PDFs en la carpeta indicada o la carpeta no existe.")
+if process:
+    if not uploaded_files:
+        st.warning("Primero sube uno o varios PDFs.")
+    else:
+        nuevos = 0
+        duplicados = 0
+        errores = 0
+        for uploaded_file in uploaded_files:
+            try:
+                uploaded_file.seek(0)
+                row = parse_izipay_uploaded_file(uploaded_file)
+
+                # Llave para evitar duplicados. Preferimos ID; si no existe, usamos archivo + fecha + hora + total.
+                key = row.get("ID") or f"{row.get('Archivo')}|{row.get('Fecha')}|{row.get('Hora')}|{row.get('Total')}"
+                if key in st.session_state.processed_keys:
+                    duplicados += 1
+                    continue
+
+                st.session_state.rows.append(row)
+                st.session_state.processed_keys.add(key)
+                nuevos += 1
+            except Exception as exc:
+                errores += 1
+                st.session_state.rows.append({
+                    "Fecha": None, "Hora": None, "Monto": None, "Propina": None, "Total": None,
+                    "ID": None, "Tipo": None, "Medio": None, "Billetera": None, "REF": None, "AP": None,
+                    "Lote": None, "Term": None, "Archivo": uploaded_file.name, "Ruta": None, "Error": str(exc),
+                })
+        st.success(f"Procesamiento terminado: {nuevos} nuevos, {duplicados} duplicados omitidos, {errores} errores.")
+
+if not st.session_state.rows:
+    st.info("Sube tus vouchers PDF desde el panel izquierdo y presiona 'Procesar PDFs cargados'.")
     st.stop()
+
+df = pd.DataFrame(st.session_state.rows)
+for col in SHOW_COLS:
+    if col not in df.columns:
+        df[col] = None
 
 # Preparar fecha para filtros.
 df["Fecha_dt"] = pd.to_datetime(df["Fecha"], format="%d/%m/%Y", errors="coerce")
@@ -59,12 +101,11 @@ if selected_months:
 if selected_medios:
     filtered = filtered[filtered["Medio"].isin(selected_medios)]
 
-# Ordenar por fecha y hora
 filtered = filtered.sort_values(["Fecha_dt", "Hora", "Archivo"], na_position="last")
 
-monto_total = filtered["Monto"].fillna(0).sum()
-propina_total = filtered["Propina"].fillna(0).sum()
-total_total = filtered["Total"].fillna(0).sum()
+monto_total = pd.to_numeric(filtered["Monto"], errors="coerce").fillna(0).sum()
+propina_total = pd.to_numeric(filtered["Propina"], errors="coerce").fillna(0).sum()
+total_total = pd.to_numeric(filtered["Total"], errors="coerce").fillna(0).sum()
 n_ops = len(filtered)
 
 k1, k2, k3, k4 = st.columns(4)
@@ -74,12 +115,10 @@ k3.metric("Propina", f"S/ {propina_total:,.2f}")
 k4.metric("Total", f"S/ {total_total:,.2f}")
 
 st.subheader("Detalle de vouchers")
-show_cols = ["Fecha", "Hora", "Monto", "Propina", "Total", "ID", "Tipo", "Medio", "Billetera", "REF", "AP", "Lote", "Term", "Archivo"]
-st.dataframe(filtered[show_cols], use_container_width=True, hide_index=True)
+st.dataframe(filtered[SHOW_COLS], use_container_width=True, hide_index=True)
 
-# Exportar a Excel
 output = BytesIO()
-export_df = filtered[show_cols].copy()
+export_df = filtered[SHOW_COLS].copy()
 with pd.ExcelWriter(output, engine="openpyxl") as writer:
     export_df.to_excel(writer, index=False, sheet_name="Ventas")
     resumen = pd.DataFrame({
@@ -95,4 +134,6 @@ st.download_button(
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 )
 
-st.info("Para incorporar nuevos PDFs, copia los archivos a la carpeta y presiona 'Actualizar lectura'.")
+if "Error" in filtered.columns and filtered["Error"].notna().any():
+    with st.expander("Ver errores de lectura"):
+        st.dataframe(filtered[filtered["Error"].notna()][["Archivo", "Error"]], use_container_width=True, hide_index=True)
