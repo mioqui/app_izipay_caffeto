@@ -1,7 +1,7 @@
 import re
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, Union, BinaryIO
 
 import pdfplumber
 import pandas as pd
@@ -17,10 +17,10 @@ COLUMNS = [
 ]
 
 
-def _extract_text_from_pdf(pdf_path: Path) -> str:
-    """Extrae texto de un PDF digital. Si el PDF fuera imagen escaneada, esto puede devolver texto vacío."""
+def _extract_text_from_pdf_source(source: Union[str, Path, BinaryIO]) -> str:
+    """Extrae texto de un PDF digital desde ruta o archivo cargado en memoria."""
     parts: List[str] = []
-    with pdfplumber.open(str(pdf_path)) as pdf:
+    with pdfplumber.open(source) as pdf:
         for page in pdf.pages:
             text = page.extract_text(x_tolerance=1, y_tolerance=3) or ""
             parts.append(text)
@@ -33,7 +33,6 @@ def _search(pattern: str, text: str, flags: int = re.IGNORECASE) -> Optional[str
 
 
 def _money(label: str, text: str) -> Optional[float]:
-    # Soporta: TOTAL: S/ 34.00, TOTAL: S/34.00, TOTAL: S/ 1,234.50
     value = _search(rf"{label}\s*:\s*S\/?\s*([0-9,]+(?:\.[0-9]{{1,2}})?)", text)
     if value is None:
         return None
@@ -41,7 +40,6 @@ def _money(label: str, text: str) -> Optional[float]:
 
 
 def _format_fecha_l(fecha: Optional[str]) -> Optional[str]:
-    # 08/03/26 -> 08/03/2026
     if not fecha:
         return None
     try:
@@ -52,25 +50,21 @@ def _format_fecha_l(fecha: Optional[str]) -> Optional[str]:
 
 
 def _parse_qr_date(text: str) -> tuple[Optional[str], Optional[str]]:
-    # Ejemplo: 08MAR26 18:21
     m = re.search(r"(\d{2})([A-ZÁÉÍÓÚÑ]{3})(\d{2})\s+(\d{1,2}:\d{2})", text, re.IGNORECASE)
     if not m:
         return None, None
     day, mon_txt, year, hour = m.groups()
-    mon = MONTHS_ES.get(mon_txt.upper().replace("Á", "A"))
+    mon_key = mon_txt.upper().replace("Á", "A").replace("É", "E").replace("Í", "I").replace("Ó", "O").replace("Ú", "U")
+    mon = MONTHS_ES.get(mon_key)
     if not mon:
         return None, hour
     return f"{day}/{mon}/20{year}", hour
 
 
-def parse_izipay_pdf(pdf_path: str | Path) -> Dict:
-    pdf_path = Path(pdf_path)
-    text = _extract_text_from_pdf(pdf_path)
+def parse_izipay_text(text: str, filename: str = "") -> Dict:
     compact = re.sub(r"[ \t]+", " ", text)
 
     medio = _search(r"\*+\d+\((L|Q)\)", compact)
-
-    # ID: en formato L suele aparecer arriba; en Q aparece al final.
     id_value = _search(r"ID\s*:\s*([A-Z0-9]+)", compact)
 
     ap = _search(r"AP\s*:\s*([A-Z0-9]+)", compact)
@@ -85,7 +79,6 @@ def parse_izipay_pdf(pdf_path: str | Path) -> Dict:
     hora = _search(r"HORA\s*:\s*(\d{1,2}:\d{2})", compact)
     fecha = _format_fecha_l(fecha)
 
-    # QR suele traer fecha/hora como 08MAR26 18:21, sin etiquetas FECHA/HORA.
     if not fecha or not hora:
         fecha_q, hora_q = _parse_qr_date(compact)
         fecha = fecha or fecha_q
@@ -95,7 +88,6 @@ def parse_izipay_pdf(pdf_path: str | Path) -> Dict:
     propina = _money("PROPINA", compact)
     total = _money("TOTAL", compact)
 
-    # Si no existe MONTO ni PROPINA, asumimos monto = total y propina = 0.
     if monto is None and total is not None:
         monto = total
     if propina is None:
@@ -115,9 +107,23 @@ def parse_izipay_pdf(pdf_path: str | Path) -> Dict:
         "AP": ap,
         "Lote": lote,
         "Term": term,
-        "Archivo": pdf_path.name,
-        "Ruta": str(pdf_path.resolve()),
+        "Archivo": filename,
+        "Ruta": None,
     }
+
+
+def parse_izipay_pdf(pdf_path: str | Path) -> Dict:
+    pdf_path = Path(pdf_path)
+    text = _extract_text_from_pdf_source(str(pdf_path))
+    row = parse_izipay_text(text, filename=pdf_path.name)
+    row["Ruta"] = str(pdf_path.resolve())
+    return row
+
+
+def parse_izipay_uploaded_file(uploaded_file) -> Dict:
+    """Procesa un PDF subido desde Streamlit st.file_uploader."""
+    text = _extract_text_from_pdf_source(uploaded_file)
+    return parse_izipay_text(text, filename=uploaded_file.name)
 
 
 def read_folder(folder_path: str | Path) -> pd.DataFrame:
